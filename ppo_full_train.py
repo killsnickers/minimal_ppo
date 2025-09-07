@@ -199,6 +199,7 @@ def ppo_step(model_actor_critic, optimizer, tokenizer, prompts, responses, old_l
 def main():
     # load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, padding_side="left")
+    tokenizer()
     tokenizer.pad_token = tokenizer.eos_token
 
     # load base model(policy model)
