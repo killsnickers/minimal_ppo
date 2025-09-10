@@ -3,9 +3,12 @@ PPO Trainer minimal
 依葫芦画瓢做的模型，这里还有很多逻辑，主要是先跑起来看看
 补充：
 这里我们明确几个概念
-return:
-value:
-reward:
+return: 这里指的就是当前的 gae + value，作为当前的return, 并且也是value的目标
+value: 这里指的是reward model根据当前的状态计算出来的价值, 这个价值是需要拟合return的
+reward: 这里一般都是指的规则reward
+
+BUG警告:
+    能看到在我们计算return的时候，核心逻辑是每个token维度的reward,而不是整体的reward，所以这里的gae的实现是完全错误的
 @豌杂 2025-09-07
 """
 # ppo_full.py
@@ -13,7 +16,7 @@ reward:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.utils.data import Dataset, DataLoader
 import os
 import math
@@ -22,12 +25,12 @@ import json
 
 
 # ----基础的参数设置---
-MODEL_NAME = 'QWEN3/0.6B'
-SAVE_DIR = ''
+MODEL_NAME = '/Users/liuzhengyong/M/model/Qwen3-0.6B'
+SAVE_DIR = '/Users/liuzhengyong/M/model/Qwen3-0.6B-RL'
 
-MAX_LENGTH = 1024  # 输入最大长度
-MAX_NEW_TOKEN_LENGTH = 500
-BATCH_SIZE = 1
+MAX_LENGTH = 100  # 输入最大长度
+MAX_NEW_TOKEN_LENGTH = 50
+BATCH_SIZE = 2
 GRADIENT_ACCUMULATION = 2
 
 LR = 1e-6
@@ -40,7 +43,7 @@ ENTROPY_COEF = 0.01  # 熵的系数
 GAMMA = 0.99  # 不知道什么含义
 LAMBDA = 0.95  # 不知道什么含义
 MAX_GRAD_NORM = 1.0
-DEVICE = "cuda"
+DEVICE = "cpu"
 
 
 # ----数据处理函数，继承Dataset ----
@@ -59,13 +62,17 @@ class minimal_dataset(Dataset):
 
     def __len__(self): return len(self.data)
 
-    def get_item(self, index):
+    def __getitem__(self, index):
         q, a = self.data[index]
         prompt = f"User: {q}\nAssistant:"
         full = f"{prompt} {a}"
         # tokenizer, 然后做截断， 截断长度为MAX_LENGTH
-        tokens = self.tokenizer(full, truncation=True, max_length=MAX_LENGTH, return_tensors="pt")
-        return tokens.input_ids[0]
+        tokens = self.tokenizer(full, truncation=True, padding='max_length', max_length=MAX_LENGTH, return_tensors="pt")
+        return {
+            'input_ids': tokens.input_ids.squeeze(0),
+            'attention_mask': tokens.attention_mask.squeeze(0),
+            'labels': a
+        }
 
 
 # ---- Actor和Critic的model计算 ----
@@ -75,7 +82,7 @@ class ActorCritic(nn.Module):
         self.model = model
 
         # value 计算的逻辑
-        hidden = model.config.n_embd
+        hidden = model.config.hidden_size
         self.value_head = nn.Linear(hidden, 1)
 
         # ref model load， 不做梯度计算
@@ -98,19 +105,18 @@ class ActorCritic(nn.Module):
 
 # ---- 采样数据 ----
 @torch.no_grad()
-def sample(model_actor_critic, tokenizer, prompt):
+def sample(model_actor_critic, tokenizer, input_ids, attention_mask=None):
     model_actor_critic.eval()
-    tokens = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-    input_ids = tokens.input_ids
     gen = model_actor_critic.model.generate(
         input_ids,
+        attention_mask=attention_mask,
         max_new_tokens=MAX_NEW_TOKEN_LENGTH,
         do_sample=True,
         temperature=0.7,
         pad_token_id=tokenizer.eos_token_id,
     )
     # 只获取其中的response部分
-    response = tokenizer.decode(gen[0][input_ids.shape[-1]:], skip_special_tokens=True)
+    response = [tokenizer.decode(item[input_ids.shape[-1]:], skip_special_tokens=True) for item in gen]
     return response, gen
 
 
@@ -131,11 +137,30 @@ def compute_gae(rewards, values, next_value, gamma=GAMMA, lam=LAMBDA):
     values = values + [next_value]   # ？这一步还不知道为什么？
     gae = 0
     returns = []
-    for step in reversed(range(len(rewards))):  # 记住这里有个reverse, 从最后一个token往前算的
-        delta = rewards[step] + gamma * values[step+1] - values[step]
-        gae = delta + gamma * lam * gae
-        returns.insert(0, gae + values[step])
+    for row in range(values.shape[0]):
+        row_returns = []
+        for step in reversed(range(len(values[row]))):  # 记住这里有个reverse, 从最后一个token往前算的
+            delta = rewards[row] + gamma * values[step+1] - values[step]
+            gae = delta + gamma * lam * gae
+            row_returns.insert(0, gae + values[step])
+        returns.append(row_returns)
     return returns
+
+    """
+    rewards = torch.tensor([[-0.2608,0.2625,0.2393,1.8045]])
+    values = torch.tensor([[-0.2169, -0.0679, -0.2465,  0.7171]])
+    # rewards = torch.randn((bs,seq_len))
+    # values=torch.randn((bs,seq_len))
+    advantages_reversed = []
+
+    for t in reversed(range(seq_len)):
+        nextvalues = values[:, t + 1] if t < seq_len - 1 else 0.0
+        delta = rewards[:, t] + gamma * nextvalues - values[:, t]
+        lastgaelam = delta + gamma * lam * lastgaelam
+        advantages_reversed.append(lastgaelam))
+    advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
+    returns = advantages + values
+    """
 
 
 # ---- ppo的每一次迭代step ----
@@ -199,7 +224,6 @@ def ppo_step(model_actor_critic, optimizer, tokenizer, prompts, responses, old_l
 def main():
     # load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, padding_side="left")
-    tokenizer()
     tokenizer.pad_token = tokenizer.eos_token
 
     # load base model(policy model)
@@ -215,13 +239,15 @@ def main():
     for epoch in range(EPOCH):
         prompts, responses, old_logprobs, rewards, values = [], [], [], [], []
         for batch in dataloader:
-            input_ids = batch.to(DEVICE)
-            prompt_ids = input_ids[:, :input_ids.shape[1] // 2]  # 前一半当prompt
-            prompt = tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
+            input_ids = batch['input_ids'].to(DEVICE)
+            attention_mask = batch['attention_mask'].to(DEVICE)
+            labels = batch['labels']
+            # prompt_ids = input_ids[:, :input_ids.shape[1] // 2]  # 前一半当prompt
+            # prompt = tokenizer.decode(prompt_ids, skip_special_tokens=True)
 
             # 提供Prompt, 然后随机采样到所有Response和generate, 并且计算整体的reward
-            response, gen = sample(model_ac, tokenizer, prompt)
-            reward = reward_fn(prompt, response)
+            response, gen = sample(model_ac, tokenizer, input_ids, attention_mask)
+            reward = reward_fn(labels, response)
 
             # 记录
             prompts.append(prompt)
@@ -230,7 +256,7 @@ def main():
             # 计算old_logprob
             full_tok = tokenizer(prompt + response, return_tensors="pt").to(DEVICE)
             with torch.no_grad():
-                ref_logits = model_ac.ref_logits(full_tok.input_ids)
+                ref_logits = model_ac.ref_forward(full_tok.input_ids)
             shift_logits = ref_logits[:, :-1, :]   # batch * len * token_num
             shift_labels = full_tok.input_ids[:, 1:]  # batch * len-1
             # shift_logits.reshape -> （b*(len0-1)) * v, shift_labels -> (b*len-1)
@@ -243,7 +269,7 @@ def main():
             rewards.append(reward)
             with torch.no_grad():
                 _, v = model_ac(full_tok.input_ids)
-                values.append(v[0, -1].item())
+                values.append(v)
         # 对当前的所有数据进行value和基础的信息获取之后，开始计算returns和gae结果了
         next_value = 0
         returns = compute_gae(rewards, values, next_value)
